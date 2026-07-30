@@ -38,17 +38,48 @@ Project context: `AGENTS.md`, `CLAUDE.md`, `KODIGO.md`, `MEMORY.md` are auto-loa
 |---|---|
 | `/help` | show commands |
 | `/new`, `/sessions`, `/resume <id>` | session management |
+| `/undo`, `/retry` | fix the last turn |
 | `/model`, `/models refresh` | model picker (auto-discovered) |
+| `/fallback <model>` | fallback chain for 429/5xx |
 | `/plan` | toggle read-only plan mode |
 | `/review [base]` | read-only review of uncommitted (or vs base) changes |
 | `/rewind` | restore the pre-task checkpoint |
 | `/init` | generate AGENTS.md for the repo |
-| `/memory` | show learned memory |
+| `/memory` | show MEMORY.md / USER.md / SOUL.md |
+| `/personality <n>` | set persona (concise/mentor/pirate/off) |
+| `/recall <query>` | search past sessions |
 | `/status` | session config + context usage |
 | `/compact` | force context compaction |
 | `/usage` | token + cost totals |
 | `/yolo` | toggle auto-approve |
 | `/exit` | quit |
+
+## The learning loop
+
+kodigo gets smarter as you use it — all transparent, all plain markdown in your repo:
+
+- **MEMORY.md** — project facts (build commands, conventions, gotchas), auto-extracted after each task, deduped
+- **USER.md** — your environment, preferences, habits
+- **SOUL.md** — agent persona (`/personality`)
+- **Auto-skills** — after a complex task (3+ tool calls), kodigo proposes saving the workflow as a reusable `/command`
+- **`/recall`** — searches all past sessions and summarizes what's relevant
+
+## Telegram gateway (assistant mode)
+
+```bash
+node src/index.js gateway                  # start the daemon
+node src/index.js gateway approve <code>   # approve a pairing request
+```
+
+Set `TELEGRAM_BOT_TOKEN` env or `telegram.token` in `~/.kodigo/config.json` (get a token from @BotFather). Unknown users get a pairing code — **default-deny**: nobody reaches the agent until you approve them. Per-chat sessions, `/new`, `/stop`, and cron:
+
+```
+/cron every 2h summarize my git log
+/cron daily 09:00 check CI status and report
+/cron list · /cron rm <id>
+```
+
+Heartbeat jobs stay quiet when there's nothing worth telling you.
 
 Custom commands: drop `.kodigo/commands/deploy.md` (optional frontmatter `name:`/`description:`) → run `/deploy`. `$ARGUMENTS` is substituted.
 
@@ -66,5 +97,5 @@ Hooks: `.kodigo/kodigo.json` → `"hooks": { "pre": [{"tool": "write", "command"
 ## Test
 
 ```bash
-node test/mock.test.js   # 33 tests, fully offline
+node test/mock.test.js   # 45 tests, fully offline
 ```

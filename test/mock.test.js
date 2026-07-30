@@ -941,6 +941,167 @@ test("recall searches across session files and summarizes", async () => {
   }
 });
 
+// ---- F6: Telegram gateway ----
+
+test("gateway: pairing default-deny, approve, then per-chat agent reply", async () => {
+  const sent = [];
+  const tgCalls = { updates: 0 };
+  // Fake Telegram client (in-memory)
+  const fakeTg = {
+    getMe: async () => ({ username: "kodigo_test_bot" }),
+    getUpdates: async () => [],
+    sendMessage: async (chatId, text) => sent.push({ chatId, text }),
+  };
+  // Mock LLM
+  const llm = await startMockServer(() => sse(textChunks("agent reply from telegram turn")));
+  const llmPort = llm.address().port;
+  const config = {
+    baseURL: `http://127.0.0.1:${llmPort}/v1`,
+    apiKey: "t",
+    model: "mock",
+    maxSteps: 3,
+    autoCompactChars: 1e9,
+    bashTimeoutMs: 5000,
+    telegram: { token: "fake" },
+  };
+  const { startGateway, approveCommand } = await import("../src/gateway/index.js");
+  const { loadStore } = await import("../src/gateway/pairing.js");
+  const store = { allowedUsers: [], pending: {} }; // injected, isolated from real store
+  const logs = [];
+  const gw = await startGateway(config, { telegram: fakeTg, store, onLog: (m) => logs.push(m), once: true });
+
+  // 1. unknown user → pairing code, NOT processed
+  await gw.handleMessage({ chat: { id: 100 }, from: { id: 555 }, text: "hello" });
+  assert.strictEqual(sent.length, 1);
+  assert.ok(sent[0].text.includes("Pairing code:"), "no pairing code sent: " + sent[0].text);
+  const code = sent[0].text.match(/Pairing code: ([A-F0-9]{6})/)[1];
+  assert.ok(logs.some((l) => l.includes("555")));
+
+  // 2. still denied before approval
+  await gw.handleMessage({ chat: { id: 100 }, from: { id: 555 }, text: "let me in" });
+  assert.strictEqual(sent.length, 2);
+  assert.ok(sent[1].text.includes("Pairing code:"));
+
+  // 3. approve via store, then message is processed by the agent
+  const { approvePairing, saveStore } = await import("../src/gateway/pairing.js");
+  const realStore = loadStore();
+  realStore.pending[code] = { userId: 555, createdAt: Date.now() };
+  const approved = approvePairing(realStore, code);
+  assert.strictEqual(approved, 555);
+  // clean up real store mutation
+  realStore.allowedUsers = realStore.allowedUsers.filter((u) => u !== 555);
+  saveStore(realStore);
+
+  // gateway's injected store needs the approval too
+  gw.store.allowedUsers.push(555);
+  await gw.handleMessage({ chat: { id: 100 }, from: { id: 555 }, text: "what is up" });
+  const reply = sent.find((s) => s.text.includes("agent reply from telegram turn"));
+  assert.ok(reply, "agent reply not sent to telegram: " + JSON.stringify(sent));
+
+  // 4. /new resets session
+  await gw.handleMessage({ chat: { id: 100 }, from: { id: 555 }, text: "/new" });
+  assert.ok(sent.some((s) => s.text === "(new session)"));
+  llm.close();
+});
+
+// ---- F7: cron scheduler + heartbeat ----
+
+test("parseSchedule: intervals and daily", async () => {
+  const { parseSchedule, nextRun } = await import("../src/gateway/scheduler.js");
+  assert.deepStrictEqual(parseSchedule("every 30m"), { type: "interval", intervalMs: 1800000 });
+  assert.deepStrictEqual(parseSchedule("every 2 hours"), { type: "interval", intervalMs: 7200000 });
+  assert.deepStrictEqual(parseSchedule("daily 09:30"), { type: "daily", hour: 9, minute: 30 });
+  assert.strictEqual(parseSchedule("whenever lol"), null);
+  const now = new Date("2026-07-31T10:00:00").getTime();
+  const nr = nextRun({ type: "daily", hour: 9, minute: 0 }, now);
+  assert.ok(nr > now, "daily 09:00 after 10:00 should be tomorrow");
+  assert.strictEqual(new Date(nr).getHours(), 9);
+});
+
+test("scheduler tick runs due job and delivers to telegram", async () => {
+  const { addJob, loadJobs, saveJobs } = await import("../src/gateway/scheduler.js");
+  const { startGateway } = await import("../src/gateway/index.js");
+  const sent = [];
+  const fakeTg = {
+    getMe: async () => ({ username: "bot" }),
+    getUpdates: async () => [],
+    sendMessage: async (chatId, text) => sent.push({ chatId, text }),
+  };
+  const llm = await startMockServer(() => sse(textChunks("scheduled report: all good")));
+  const llmPort = llm.address().port;
+  const config = {
+    baseURL: `http://127.0.0.1:${llmPort}/v1`,
+    apiKey: "t",
+    model: "mock",
+    maxSteps: 3,
+    autoCompactChars: 1e9,
+    bashTimeoutMs: 5000,
+    telegram: { token: "fake" },
+  };
+  const store = { allowedUsers: [555], pending: {} };
+  const gw = await startGateway(config, { telegram: fakeTg, store, onLog: () => {}, once: true });
+
+  const jobsFile = path.join(os.homedir(), ".kodigo", "scheduler.json");
+  const backup = fs.existsSync(jobsFile) ? fs.readFileSync(jobsFile, "utf8") : null;
+  try {
+    const jobs = [];
+    const job = addJob(jobs, { chatId: 100, prompt: "give me the report", schedule: { type: "interval", intervalMs: 60000 } });
+    job.nextRunAt = Date.now() - 1000; // make due
+    saveJobs(jobs);
+
+    const sched = gw.startScheduler({ tickOnce: true });
+    await sched.tick();
+    assert.ok(sent.some((s) => s.chatId === 100 && s.text.includes("scheduled report")), "job output not delivered: " + JSON.stringify(sent));
+    const after = loadJobs();
+    assert.ok(after[0].nextRunAt > Date.now(), "job not rescheduled");
+    assert.ok(after[0].lastRunAt, "lastRunAt not set");
+  } finally {
+    if (backup) fs.writeFileSync(jobsFile, backup);
+    else fs.rmSync(jobsFile, { force: true });
+    llm.close();
+  }
+});
+
+test("heartbeat suppresses quiet replies", async () => {
+  const { addJob, saveJobs, loadJobs } = await import("../src/gateway/scheduler.js");
+  const { startGateway } = await import("../src/gateway/index.js");
+  const sent = [];
+  const fakeTg = {
+    getMe: async () => ({ username: "bot" }),
+    getUpdates: async () => [],
+    sendMessage: async (chatId, text) => sent.push({ chatId, text }),
+  };
+  const llm = await startMockServer(() => sse(textChunks("Nothing new to report.")));
+  const llmPort = llm.address().port;
+  const config = {
+    baseURL: `http://127.0.0.1:${llmPort}/v1`,
+    apiKey: "t",
+    model: "mock",
+    maxSteps: 3,
+    autoCompactChars: 1e9,
+    bashTimeoutMs: 5000,
+    telegram: { token: "fake" },
+  };
+  const store = { allowedUsers: [555], pending: {} };
+  const gw = await startGateway(config, { telegram: fakeTg, store, onLog: () => {}, once: true });
+  const jobsFile = path.join(os.homedir(), ".kodigo", "scheduler.json");
+  const backup = fs.existsSync(jobsFile) ? fs.readFileSync(jobsFile, "utf8") : null;
+  try {
+    const jobs = [];
+    const job = addJob(jobs, { chatId: 100, prompt: "check in", schedule: { type: "interval", intervalMs: 60000 }, kind: "heartbeat" });
+    job.nextRunAt = Date.now() - 1000;
+    saveJobs(jobs);
+    const sched = gw.startScheduler({ tickOnce: true });
+    await sched.tick();
+    assert.strictEqual(sent.length, 0, "quiet heartbeat should not message the user");
+    assert.ok(loadJobs()[0].lastRunAt, "heartbeat still marked as ran");
+  } finally {
+    if (backup) fs.writeFileSync(jobsFile, backup);
+    else fs.rmSync(jobsFile, { force: true });
+    llm.close();
+  }
+});
+
 let failures = 0;
 for (const { name, fn } of results) {
   try {

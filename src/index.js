@@ -16,6 +16,8 @@ Usage:
   kodigo -c, --continue     continue the most recent session
   kodigo run "<prompt>"     one-shot mode, then exit
   kodigo -p "<prompt>"      same; also accepts piped stdin
+  kodigo gateway            run the Telegram gateway (daemon)
+  kodigo gateway approve <code>   approve a pairing request
   kodigo config             show resolved configuration
   kodigo --version          print version
   kodigo --help             show this help
@@ -112,6 +114,28 @@ async function main() {
     process.stdout.write(
       JSON.stringify({ ...config, apiKey: masked }, null, 2) + "\n"
     );
+    return;
+  }
+
+  if (cmd === "gateway") {
+    const sub = opts._[1];
+    if (sub === "approve") {
+      const code = opts._[2];
+      if (!code) {
+        process.stderr.write("Usage: kodigo gateway approve <code>\n");
+        process.exit(1);
+      }
+      const { approveCommand } = await import("./gateway/index.js");
+      const userId = approveCommand(code);
+      if (userId) process.stdout.write(paint("green", `Approved user ${userId}.\n`));
+      else process.stdout.write(paint("red", `No pending pairing with code ${code}.\n`));
+      return;
+    }
+    process.stdout.write(paint("cyan", "◆ kodigo gateway") + paint("gray", " — Ctrl+C to stop\n"));
+    const { startGateway } = await import("./gateway/index.js");
+    const gw = await startGateway(config);
+    gw.startScheduler();
+    await gw.pollLoop();
     return;
   }
 
