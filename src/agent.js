@@ -210,10 +210,20 @@ export async function runAgent({ session, userText, config, permissions, planMod
         if (parseError) {
           result = parseError;
         } else {
-          const allowed = await permissions.ask(tc.function.name, input);
-          result = allowed
-            ? await executeTool(tc.function.name, input, { cwd: process.cwd(), config, planMode, todos, shell })
-            : "Error: user denied permission";
+          const { runHooks } = await import("./hooks.js");
+          const pre = await runHooks(config, "pre", tc.function.name, process.cwd());
+          if (pre.denied) {
+            result = "Error: " + pre.message;
+          } else {
+            const allowed = await permissions.ask(tc.function.name, input);
+            if (!allowed) {
+              result = "Error: user denied permission";
+            } else {
+              result = await executeTool(tc.function.name, input, { cwd: process.cwd(), config, planMode, todos, shell });
+              const post = await runHooks(config, "post", tc.function.name, process.cwd());
+              if (post.appended) result += `\n[post-hook output]\n${post.appended}`;
+            }
+          }
         }
         emit({ type: "tool_end", name: tc.function.name, result });
         session.messages.push({ role: "tool", tool_call_id: tc.id, content: result });

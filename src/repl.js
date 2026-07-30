@@ -283,6 +283,39 @@ export async function startRepl({ config, session, initialPlanMode = false }) {
     }
     rl.pause();
     if (input.startsWith("/")) {
+      const [cmdName, ...cmdRest] = input.slice(1).split(/\s+/);
+      const { loadCommands } = await import("./commands.js");
+      const custom = loadCommands(process.cwd()).get(cmdName);
+      if (custom) {
+        const body = custom.body.replace(/\$ARGUMENTS/g, cmdRest.join(" "));
+        running = true;
+        currentAbort = new AbortController();
+        try {
+          const { createCheckpoint } = await import("./checkpoint.js");
+          lastCheckpoint = createCheckpoint(process.cwd());
+        } catch {
+          lastCheckpoint = null;
+        }
+        try {
+          process.stdout.write("\n");
+          await runAgent({
+            session,
+            userText: body,
+            config,
+            permissions,
+            planMode,
+            signal: currentAbort.signal,
+          });
+          process.stdout.write("\n");
+        } catch (e) {
+          process.stdout.write(paint("red", `✗ ${e.message}\n`));
+        } finally {
+          running = false;
+          currentAbort = null;
+        }
+        prompt();
+        return;
+      }
       await handleSlash(input);
       prompt();
       return;

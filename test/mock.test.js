@@ -622,6 +622,114 @@ test("/init flow: agent writes AGENTS.md via tools", async () => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
+// ---- M7: slash commands ----
+
+test("frontmatter parser extracts meta and body", async () => {
+  const { parseFrontmatter } = await import("../src/commands.js");
+  const { meta, body } = parseFrontmatter('---\nname: review\ndescription: "Review code"\n---\nReview $ARGUMENTS carefully\n');
+  assert.strictEqual(meta.name, "review");
+  assert.strictEqual(meta.description, "Review code");
+  assert.ok(body.includes("$ARGUMENTS"));
+  const plain = parseFrontmatter("no frontmatter here");
+  assert.deepStrictEqual(plain.meta, {});
+  assert.strictEqual(plain.body, "no frontmatter here");
+});
+
+test("loadCommands reads .kodigo/commands/*.md", async () => {
+  const { loadCommands } = await import("../src/commands.js");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kodigo-test-"));
+  fs.mkdirSync(path.join(tmp, ".kodigo", "commands"), { recursive: true });
+  fs.writeFileSync(path.join(tmp, ".kodigo", "commands", "audit.md"), "---\ndescription: security audit\n---\nAudit the code for $ARGUMENTS\n");
+  fs.writeFileSync(path.join(tmp, ".kodigo", "commands", "broken.txt"), "not md, ignored");
+  const cmds = loadCommands(tmp);
+  assert.strictEqual(cmds.size, 1);
+  const audit = cmds.get("audit");
+  assert.strictEqual(audit.description, "security audit");
+  assert.ok(audit.body.includes("$ARGUMENTS"));
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+// ---- M8: hooks ----
+
+test("pre-hook non-zero exit denies the tool", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kodigo-test-"));
+  const origCwd = process.cwd();
+  process.chdir(tmp);
+  const denyCmd = process.platform === "win32" ? "exit 1" : "exit 1";
+  let hookRan = false;
+  const server = await startMockServer((body) => {
+    if (body.messages.some((m) => m.role === "tool")) {
+      const toolMsg = body.messages.find((m) => m.role === "tool");
+      hookRan = true;
+      assert.ok(toolMsg.content.includes("Hook denied"), "hook denial not in transcript: " + toolMsg.content);
+      return sse(textChunks("understood, hook blocked it"));
+    }
+    return sse(toolCallChunks("c1", "write", JSON.stringify({ filePath: "hooked.txt", content: "x" })));
+  });
+  const port = server.address().port;
+  const config = {
+    baseURL: `http://127.0.0.1:${port}/v1`,
+    apiKey: "t",
+    model: "mock",
+    maxSteps: 4,
+    autoCompactChars: 1e9,
+    bashTimeoutMs: 5000,
+    yolo: true,
+    hooks: { pre: [{ tool: "write", command: denyCmd }] },
+  };
+  const session = newSession();
+  await runAgent({
+    session,
+    userText: "write a file",
+    config,
+    permissions: { ask: async () => true },
+    emit: () => {},
+  });
+  server.close();
+  assert.ok(hookRan);
+  assert.ok(!fs.existsSync(path.join(tmp, "hooked.txt")), "hook should have blocked the write");
+  process.chdir(origCwd);
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+test("post-hook stdout is appended to tool result", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kodigo-test-"));
+  const origCwd = process.cwd();
+  process.chdir(tmp);
+  let sawPostOutput = false;
+  const server = await startMockServer((body) => {
+    const toolMsg = body.messages.find((m) => m.role === "tool");
+    if (toolMsg) {
+      sawPostOutput = toolMsg.content.includes("post-hook-output-marker");
+      return sse(textChunks("done"));
+    }
+    return sse(toolCallChunks("c1", "write", JSON.stringify({ filePath: "p.txt", content: "x" })));
+  });
+  const port = server.address().port;
+  const config = {
+    baseURL: `http://127.0.0.1:${port}/v1`,
+    apiKey: "t",
+    model: "mock",
+    maxSteps: 4,
+    autoCompactChars: 1e9,
+    bashTimeoutMs: 5000,
+    yolo: true,
+    hooks: { post: [{ tool: "write", command: "echo post-hook-output-marker" }] },
+  };
+  const session = newSession();
+  await runAgent({
+    session,
+    userText: "write a file",
+    config,
+    permissions: { ask: async () => true },
+    emit: () => {},
+  });
+  server.close();
+  assert.ok(sawPostOutput, "post-hook output did not reach the model");
+  process.chdir(origCwd);
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
 let failures = 0;
 for (const { name, fn } of results) {
   try {
