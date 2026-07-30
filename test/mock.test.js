@@ -536,6 +536,92 @@ test("review flow runs read-only and leaves files untouched", async () => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
+// ---- M6: memory + /init ----
+
+test("memory: append + read round-trip", async () => {
+  const { appendLearnings, readMemory } = await import("../src/memory.js");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kodigo-test-"));
+  const n = appendLearnings("- tests run via node test/mock.test.js\n- npm ps1 shim is blocked on this machine\nnot a bullet", tmp);
+  assert.strictEqual(n, 2);
+  const mem = readMemory(tmp);
+  assert.ok(mem.includes("## Learnings"));
+  assert.ok(mem.includes("tests run via"));
+  appendLearnings("- windows taskkill kills process trees", tmp);
+  const mem2 = readMemory(tmp);
+  assert.ok(mem2.includes("taskkill"));
+  assert.ok(mem2.includes("tests run via"), "earlier learnings lost");
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+test("memory: extractLearnings returns bullets, NONE handled", async () => {
+  const { extractLearnings, appendLearnings, readMemory } = await import("../src/memory.js");
+  let mode = "bullets";
+  const server = await startMockServer((body) => {
+    // complete() is non-streaming; detect by absence of stream flag
+    if (!body.stream) {
+      return JSON.stringify({
+        choices: [{ message: { content: mode === "bullets" ? "- use npm via cmd, not powershell\n- k3-256k context is 256k tokens" : "NONE" } }],
+      });
+    }
+    return sse(textChunks("done"));
+  });
+  const port = server.address().port;
+  const config = { baseURL: `http://127.0.0.1:${port}/v1`, apiKey: "t", model: "mock" };
+  const session = newSession();
+  session.messages.push(
+    { role: "user", content: "run tests" },
+    { role: "assistant", content: "ok" },
+    { role: "tool", tool_call_id: "1", content: "passed" }
+  );
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kodigo-test-"));
+  const out = await extractLearnings(session, config);
+  assert.ok(out.includes("npm via cmd"));
+  appendLearnings(out, tmp);
+  assert.ok(readMemory(tmp).includes("k3-256k"));
+  mode = "none";
+  const out2 = await extractLearnings(session, config);
+  assert.strictEqual(out2, "");
+  server.close();
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+test("/init flow: agent writes AGENTS.md via tools", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kodigo-test-"));
+  const origCwd = process.cwd();
+  process.chdir(tmp);
+  let requestCount = 0;
+  const server = await startMockServer(() => {
+    requestCount++;
+    if (requestCount === 1) {
+      return sse(toolCallChunks("c1", "write", JSON.stringify({ filePath: "AGENTS.md", content: "# Agents\nTest project.\n" })));
+    }
+    return sse(textChunks("AGENTS.md created"));
+  });
+  const port = server.address().port;
+  const config = {
+    baseURL: `http://127.0.0.1:${port}/v1`,
+    apiKey: "t",
+    model: "mock",
+    maxSteps: 5,
+    autoCompactChars: 1e9,
+    bashTimeoutMs: 5000,
+    yolo: true,
+  };
+  const session = newSession();
+  await runAgent({
+    session,
+    userText: "Explore this repo and write AGENTS.md",
+    config,
+    permissions: { ask: async () => true },
+    emit: () => {},
+  });
+  server.close();
+  process.chdir(origCwd);
+  assert.ok(fs.existsSync(path.join(tmp, "AGENTS.md")));
+  assert.ok(fs.readFileSync(path.join(tmp, "AGENTS.md"), "utf8").includes("Test project"));
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
 let failures = 0;
 for (const { name, fn } of results) {
   try {

@@ -17,6 +17,8 @@ ${paint("bold", "Commands:")}
   /review [base]     read-only review of uncommitted (or vs base) changes
   /rewind            restore the pre-task checkpoint
   /status            session config + context usage
+  /init              generate AGENTS.md for this repo
+  /memory            show learned memory (MEMORY.md)
   /compact           force context compaction
   /usage             show token usage
   /yolo              toggle auto-approve of all tools
@@ -225,6 +227,35 @@ export async function startRepl({ config, session, initialPlanMode = false }) {
         }
         break;
       }
+      case "init": {
+        running = true;
+        currentAbort = new AbortController();
+        try {
+          process.stdout.write("\n");
+          await runAgent({
+            session,
+            userText:
+              "Explore this repository with read/glob/grep, then write an AGENTS.md at the repo root documenting: project purpose, structure, build/test/dev commands, conventions, and anything a coding agent must know. Keep it concise and accurate. If AGENTS.md already exists, update it instead.",
+            config,
+            permissions,
+            planMode: false,
+            signal: currentAbort.signal,
+          });
+          process.stdout.write("\n");
+        } catch (e) {
+          process.stdout.write(paint("red", `✗ ${e.message}\n`));
+        } finally {
+          running = false;
+          currentAbort = null;
+        }
+        break;
+      }
+      case "memory": {
+        const { readMemory } = await import("./memory.js");
+        const mem = readMemory(process.cwd());
+        process.stdout.write(mem ? mem + "\n" : paint("gray", "(no memory yet — learnings appear here as you work)\n"));
+        break;
+      }
       case "usage":
         process.stdout.write(
           paint("gray", `prompt: ${session.usage.prompt} | completion: ${session.usage.completion} | cost: $${(session.cost || 0).toFixed(4)}\n`)
@@ -275,6 +306,14 @@ export async function startRepl({ config, session, initialPlanMode = false }) {
         signal: currentAbort.signal,
       });
       process.stdout.write("\n");
+      try {
+        const { extractLearnings, appendLearnings } = await import("./memory.js");
+        const learnings = await extractLearnings(session, config);
+        if (learnings) {
+          const n = appendLearnings(learnings, process.cwd());
+          if (n) process.stdout.write(paint("gray", `(memory: +${n} learning${n > 1 ? "s" : ""} → MEMORY.md)\n`));
+        }
+      } catch {}
     } catch (e) {
       process.stdout.write(paint("red", `✗ ${e.message}\n`));
     } finally {

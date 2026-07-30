@@ -60,7 +60,7 @@ export function saveConfig(patch) {
 }
 
 export function loadProjectContext(cwd = process.cwd()) {
-  const names = ["AGENTS.md", "CLAUDE.md", "KODIGO.md"];
+  const names = ["AGENTS.md", "CLAUDE.md", "KODIGO.md", "MEMORY.md"];
   const found = [];
   let dir = cwd;
   for (let i = 0; i < 6; i++) {
