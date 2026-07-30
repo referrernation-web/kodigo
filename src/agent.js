@@ -1,10 +1,10 @@
 import { streamChat, complete } from "./llm.js";
-import { TOOL_SCHEMAS, executeTool } from "./tools.js";
+import { TOOL_SCHEMAS, executeTool, detectShell } from "./tools.js";
 import { loadProjectContext } from "./config.js";
 import { saveSession } from "./session.js";
 import { spinner, printTool, paint } from "./ui.js";
 
-export function systemPrompt(config, planMode) {
+export function systemPrompt(config, planMode, shellName) {
   const parts = [
     `You are Kodigo, a coding agent running in the user's terminal. You help with software engineering tasks: writing code, fixing bugs, refactoring, running commands, and explaining code.`,
     ``,
@@ -26,6 +26,7 @@ export function systemPrompt(config, planMode) {
     `Environment:`,
     `- cwd: ${process.cwd()}`,
     `- platform: ${process.platform}`,
+    `- shell: ${shellName} (the bash tool runs commands with this shell)`,
     `- date: ${new Date().toDateString()}`
   );
   for (const ctx of loadProjectContext()) {
@@ -69,14 +70,33 @@ export async function compactSession(session, config) {
   }
 }
 
+export function pricingFor(config, model) {
+  const table = config.pricing || {};
+  return table[model] || table["default"] || null;
+}
+
+export function turnCost(config, model, usage) {
+  const p = pricingFor(config, model);
+  if (!p || !usage) return 0;
+  return ((usage.prompt_tokens || 0) * (p.prompt || 0) + (usage.completion_tokens || 0) * (p.completion || 0)) / 1e6;
+}
+
 export async function runAgent({ session, userText, config, permissions, planMode = false, signal }) {
   const todos = [];
+  const shell = detectShell();
   session.messages.push({ role: "user", content: userText });
-  const sysMsg = { role: "system", content: systemPrompt(config, planMode) };
+  const sysMsg = { role: "system", content: systemPrompt(config, planMode, shell.name) };
 
   try {
     for (let step = 0; step < (config.maxSteps || 100); step++) {
       if (signal?.aborted) break;
+      if (config.budget && session.cost >= config.budget) {
+        process.stdout.write(
+          paint("yellow", `\n(budget reached: $${session.cost.toFixed(4)} of $${config.budget} — stopping. Raise with --budget <usd>)\n`)
+        );
+        saveSession(session);
+        return;
+      }
       if (JSON.stringify(session.messages).length > (config.autoCompactChars || 120000)) {
         await compactSession(session, config);
       }
@@ -142,6 +162,11 @@ export async function runAgent({ session, userText, config, permissions, planMod
       if (usage) {
         session.usage.prompt += usage.prompt_tokens || 0;
         session.usage.completion += usage.completion_tokens || 0;
+        const turn = turnCost(config, config.model, usage);
+        if (turn > 0) {
+          session.cost += turn;
+          process.stdout.write(paint("gray", `\n[$${session.cost.toFixed(4)} total]`));
+        }
       }
 
       if (!calls.length) {
@@ -182,7 +207,7 @@ export async function runAgent({ session, userText, config, permissions, planMod
         } else {
           const allowed = await permissions.ask(tc.function.name, input);
           result = allowed
-            ? await executeTool(tc.function.name, input, { cwd: process.cwd(), config, planMode, todos })
+            ? await executeTool(tc.function.name, input, { cwd: process.cwd(), config, planMode, todos, shell })
             : "Error: user denied permission";
         }
         const preview = result.length > 400 ? result.slice(0, 400) + "…" : result;

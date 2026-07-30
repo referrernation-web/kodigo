@@ -4,7 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import assert from "node:assert";
 import { runAgent } from "../src/agent.js";
-import { executeTool } from "../src/tools.js";
+import { executeTool, detectShell } from "../src/tools.js";
+import { isDeniedPath, redactSecrets } from "../src/guard.js";
 import { newSession } from "../src/session.js";
 
 const results = [];
@@ -156,6 +157,144 @@ test("grep finds matches", async () => {
   const res = await executeTool("grep", { pattern: "foo" }, ctx);
   assert.ok(res.includes("a.js:1:"));
   fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+// ---- M1: security + Windows hardening ----
+
+test("deny-list: ~/.kodigo and .env blocked", () => {
+  assert.ok(isDeniedPath(path.join(os.homedir(), ".kodigo", "config.json")));
+  assert.ok(isDeniedPath(path.join(os.homedir(), ".kodigo", "sessions", "x.json")));
+  assert.ok(isDeniedPath(path.join("proj", ".env")));
+  assert.ok(isDeniedPath(path.join("proj", ".env.local")));
+  assert.ok(isDeniedPath(path.join("proj", "id_rsa.pem")));
+  assert.ok(!isDeniedPath(path.join("proj", "src", "index.js")));
+});
+
+test("deny-list: read tool refuses sensitive path", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kodigo-test-"));
+  fs.writeFileSync(path.join(tmp, ".env"), "SECRET=1");
+  const ctx = { cwd: tmp, config: {}, planMode: false, todos: [] };
+  const res = await executeTool("read", { filePath: path.join(tmp, ".env") }, ctx);
+  assert.ok(res.includes("denied"), "expected denial, got: " + res);
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+test("deny-list: 'Did you mean' hides sensitive siblings", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kodigo-test-"));
+  fs.writeFileSync(path.join(tmp, ".env.production"), "SECRET=1");
+  fs.writeFileSync(path.join(tmp, "environment.js"), "x");
+  const ctx = { cwd: tmp, config: {}, planMode: false, todos: [] };
+  const res = await executeTool("read", { filePath: path.join(tmp, "env.js") }, ctx);
+  assert.ok(res.includes("File not found"));
+  assert.ok(!res.includes(".env.production"), "leaked sensitive filename: " + res);
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+test("redaction: sk-* tokens stripped from tool output", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kodigo-test-"));
+  const f = path.join(tmp, "note.txt");
+  fs.writeFileSync(f, "key is sk-testabcdef1234567890 ok");
+  const ctx = { cwd: tmp, config: {}, planMode: false, todos: [] };
+  const res = await executeTool("read", { filePath: f }, ctx);
+  assert.ok(!res.includes("sk-testabcdef1234567890"), "key not redacted: " + res);
+  assert.ok(res.includes("[redacted]"));
+  assert.strictEqual(redactSecrets("ghp_abcdefghijklmnopqrstuvwxyz1234"), "ghp_ab…[redacted]");
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+test("webfetch: SSRF block on localhost and metadata IP", async () => {
+  const ctx = { cwd: process.cwd(), config: {}, planMode: false, todos: [] };
+  for (const url of ["http://localhost:8080/", "http://127.0.0.1/", "http://169.254.169.254/latest", "ftp://example.com/x"]) {
+    const res = await executeTool("webfetch", { url }, ctx);
+    assert.ok(res.startsWith("Error:"), "expected block for " + url + ", got: " + res);
+  }
+});
+
+test("shell detection returns a usable shell", () => {
+  const shell = detectShell();
+  assert.ok(shell.command && typeof shell.args === "function");
+  assert.ok(["git-bash", "powershell", "sh"].includes(shell.name));
+});
+
+test("bash runs through detected shell and reports it", async () => {
+  const ctx = { cwd: process.cwd(), config: { bashTimeoutMs: 10000 }, planMode: false, todos: [] };
+  const res = await executeTool("bash", { command: "echo hello-m1" }, ctx);
+  assert.ok(res.includes("hello-m1"), "no output: " + res);
+  assert.ok(res.includes("[shell:"), "shell not reported: " + res);
+});
+
+test("SSE parser tolerates CRLF line endings", async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.end(
+      'data: {"choices":[{"delta":{"content":"crlf-ok"}}]}\r\n\r\n' +
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\r\n\r\n' +
+        "data: [DONE]\r\n\r\n"
+    );
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const port = server.address().port;
+  const { streamChat } = await import("../src/llm.js");
+  let text = "";
+  for await (const ev of streamChat({
+    baseURL: `http://127.0.0.1:${port}/v1`,
+    apiKey: "t",
+    model: "m",
+    messages: [],
+    tools: [],
+  })) {
+    if (ev.type === "text") text += ev.text;
+  }
+  server.close();
+  assert.strictEqual(text, "crlf-ok");
+});
+
+// ---- M2: cost + budget ----
+
+test("cost tracked from usage with pricing table", async () => {
+  const server = await startMockServer(() => sse(textChunks("hi")));
+  const port = server.address().port;
+  const config = {
+    baseURL: `http://127.0.0.1:${port}/v1`,
+    apiKey: "t",
+    model: "k3-256k",
+    maxSteps: 2,
+    autoCompactChars: 1e9,
+    bashTimeoutMs: 5000,
+    yolo: true,
+    pricing: { "k3-256k": { prompt: 1.0, completion: 1.0 } },
+  };
+  const session = newSession();
+  await runAgent({ session, userText: "hi", config, permissions: { ask: async () => true } });
+  server.close();
+  assert.ok(session.cost > 0, "cost not tracked");
+  const expected = (10 + 5) / 1e6;
+  assert.ok(Math.abs(session.cost - expected) < 1e-9, `cost ${session.cost} != ${expected}`);
+});
+
+test("budget hard stop prevents API call", async () => {
+  let requests = 0;
+  const server = await startMockServer(() => {
+    requests++;
+    return sse(textChunks("should not happen"));
+  });
+  const port = server.address().port;
+  const config = {
+    baseURL: `http://127.0.0.1:${port}/v1`,
+    apiKey: "t",
+    model: "k3-256k",
+    maxSteps: 5,
+    autoCompactChars: 1e9,
+    bashTimeoutMs: 5000,
+    yolo: true,
+    budget: 0.0001,
+    pricing: { "k3-256k": { prompt: 1.0, completion: 1.0 } },
+  };
+  const session = newSession();
+  session.cost = 0.0002; // already over budget
+  await runAgent({ session, userText: "hi", config, permissions: { ask: async () => true } });
+  server.close();
+  assert.strictEqual(requests, 0, "API was called despite budget");
 });
 
 let failures = 0;

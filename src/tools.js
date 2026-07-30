@@ -1,10 +1,34 @@
 import fs from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { paint } from "./ui.js";
+import { redactSecrets, isDeniedPath, DENIED_MSG } from "./guard.js";
 
 const OUT_CAP = 30000;
 const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", "coverage"]);
+
+export function detectShell() {
+  if (process.platform === "win32") {
+    const gitBash = [
+      "C:\\Program Files\\Git\\bin\\bash.exe",
+      "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+      process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Programs", "Git", "bin", "bash.exe") : null,
+    ].find((p) => p && fs.existsSync(p));
+    if (gitBash) return { name: "git-bash", command: gitBash, args: (c) => ["-c", c] };
+    return { name: "powershell", command: "powershell.exe", args: (c) => ["-NoProfile", "-NonInteractive", "-Command", c] };
+  }
+  return { name: "sh", command: "/bin/sh", args: (c) => ["-c", c] };
+}
+
+function killTree(child) {
+  if (process.platform === "win32") {
+    try {
+      execFileSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
+    } catch {}
+  } else {
+    child.kill("SIGKILL");
+  }
+}
 
 function cap(s, limit = OUT_CAP) {
   s = String(s);
@@ -208,14 +232,14 @@ function isTextFile(full) {
 
 async function runBash(input, ctx) {
   const timeout = input.timeout || ctx.config.bashTimeoutMs || 120000;
+  const shell = ctx.shell || detectShell();
   return new Promise((resolve) => {
-    const child = spawn(input.command, { shell: true, cwd: ctx.cwd });
+    const child = spawn(shell.command, shell.args(input.command), { cwd: ctx.cwd });
     let out = "";
     let killed = false;
     const timer = setTimeout(() => {
       killed = true;
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 2000).unref?.();
+      killTree(child);
     }, timeout);
     child.stdout.on("data", (d) => (out += d.toString()));
     child.stderr.on("data", (d) => (out += d.toString()));
@@ -228,13 +252,14 @@ async function runBash(input, ctx) {
       let res = cap(out.trim());
       if (killed) res += `\n(killed: exceeded ${timeout}ms timeout)`;
       if (code && code !== 0) res += `\n(exit code ${code})`;
-      resolve(res || "(no output)");
+      resolve((res || "(no output)") + `\n[shell: ${shell.name}]`);
     });
   });
 }
 
 function runRead(input, ctx) {
   const p = resolvePath(ctx.cwd, input.filePath);
+  if (isDeniedPath(p)) throw new Error(DENIED_MSG.replace("Error: ", ""));
   if (!fs.existsSync(p)) {
     let suggestion = "";
     try {
@@ -242,6 +267,7 @@ function runRead(input, ctx) {
       const base = path.basename(p).toLowerCase();
       const similar = fs
         .readdirSync(dir)
+        .filter((f) => !isDeniedPath(path.join(dir, f)))
         .filter((f) => f.toLowerCase().includes(base.slice(0, 4)) || base.includes(f.toLowerCase().slice(0, 4)))
         .slice(0, 5);
       if (similar.length) suggestion = ` Did you mean: ${similar.join(", ")}?`;
@@ -261,11 +287,21 @@ function runRead(input, ctx) {
   return cap(out);
 }
 
+function syntaxCheck(p) {
+  if (!p.endsWith(".js") && !p.endsWith(".mjs")) return "";
+  try {
+    execFileSync(process.execPath, ["--check", p], { stdio: "pipe" });
+    return "";
+  } catch (e) {
+    return "\nWARNING: syntax check failed: " + String(e.stderr || e.message).slice(0, 300);
+  }
+}
+
 function runWrite(input, ctx) {
   const p = resolvePath(ctx.cwd, input.filePath);
   fs.mkdirSync(path.dirname(p), { recursive: true });
   fs.writeFileSync(p, input.content);
-  return `Wrote ${Buffer.byteLength(input.content)} bytes to ${p}`;
+  return `Wrote ${Buffer.byteLength(input.content)} bytes to ${p}` + syntaxCheck(p);
 }
 
 function runEdit(input, ctx) {
@@ -279,12 +315,12 @@ function runEdit(input, ctx) {
     throw new Error(`oldString appears ${count} times; provide more context or set replaceAll`);
   const next = parts.join(input.newString);
   fs.writeFileSync(p, next);
-  return `Edited ${p} (${input.replaceAll ? count + " replacements" : "1 replacement"})`;
+  return `Edited ${p} (${input.replaceAll ? count + " replacements" : "1 replacement"})` + syntaxCheck(p);
 }
 
 function runGlob(input, ctx) {
   const base = input.path ? resolvePath(ctx.cwd, input.path) : ctx.cwd;
-  const files = walk(base);
+  const files = walk(base).filter((f) => !isDeniedPath(f));
   const re = globToRegex(input.pattern);
   const matches = files
     .filter((f) => re.test(path.relative(base, f).replace(/\\/g, "/")) || re.test(f.replace(/\\/g, "/")))
@@ -304,7 +340,7 @@ function runGrep(input, ctx) {
     throw new Error("Invalid regex: " + e.message);
   }
   const includeRe = input.include ? globToRegex(input.include) : null;
-  const files = fs.statSync(base).isDirectory() ? walk(base) : [base];
+  const files = (fs.statSync(base).isDirectory() ? walk(base) : [base]).filter((f) => !isDeniedPath(f));
   const results = [];
   for (const f of files) {
     if (includeRe && !includeRe.test(path.basename(f))) continue;
@@ -325,7 +361,17 @@ function runGrep(input, ctx) {
   return results.length ? results.join("\n") : "(no matches)";
 }
 
+const BLOCKED_HOST_RE = /^(localhost|127\.|0\.0\.0\.0|169\.254\.169\.254|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?)/i;
+
 async function runWebfetch(input) {
+  let url;
+  try {
+    url = new URL(input.url);
+  } catch {
+    throw new Error("Invalid URL: " + input.url);
+  }
+  if (!["http:", "https:"].includes(url.protocol)) throw new Error("Only http/https URLs allowed");
+  if (BLOCKED_HOST_RE.test(url.hostname)) throw new Error("Blocked host (SSRF protection): " + url.hostname);
   const res = await fetch(input.url, {
     headers: { "User-Agent": "kodigo/0.1 (+https://localhost)" },
     signal: AbortSignal.timeout(30000),
@@ -365,26 +411,29 @@ export async function executeTool(name, input, ctx) {
     if (ctx.planMode && ["bash", "write", "edit"].includes(name)) {
       return "Error: tool disabled in plan mode";
     }
-    switch (name) {
-      case "bash":
-        return await runBash(input, ctx);
-      case "read":
-        return runRead(input, ctx);
-      case "write":
-        return runWrite(input, ctx);
-      case "edit":
-        return runEdit(input, ctx);
-      case "glob":
-        return runGlob(input, ctx);
-      case "grep":
-        return runGrep(input, ctx);
-      case "webfetch":
-        return await runWebfetch(input);
-      case "todowrite":
-        return runTodowrite(input, ctx);
-      default:
-        return `Error: unknown tool "${name}"`;
-    }
+    const result = await (async () => {
+      switch (name) {
+        case "bash":
+          return await runBash(input, ctx);
+        case "read":
+          return runRead(input, ctx);
+        case "write":
+          return runWrite(input, ctx);
+        case "edit":
+          return runEdit(input, ctx);
+        case "glob":
+          return runGlob(input, ctx);
+        case "grep":
+          return runGrep(input, ctx);
+        case "webfetch":
+          return await runWebfetch(input);
+        case "todowrite":
+          return runTodowrite(input, ctx);
+        default:
+          return `Error: unknown tool "${name}"`;
+      }
+    })();
+    return redactSecrets(result);
   } catch (e) {
     return "Error: " + e.message;
   }

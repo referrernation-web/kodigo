@@ -34,6 +34,7 @@ export async function* streamChat({ baseURL, apiKey, model, messages, tools, sig
 
   for await (const chunk of res.body) {
     buffer += decoder.decode(chunk, { stream: true });
+    buffer = buffer.replace(/\r\n/g, "\n");
     let idx;
     while ((idx = buffer.indexOf("\n\n")) !== -1) {
       const event = buffer.slice(0, idx);

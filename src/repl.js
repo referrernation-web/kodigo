@@ -120,7 +120,7 @@ export async function startRepl({ config, session, initialPlanMode = false }) {
       }
       case "usage":
         process.stdout.write(
-          paint("gray", `prompt: ${session.usage.prompt} | completion: ${session.usage.completion}\n`)
+          paint("gray", `prompt: ${session.usage.prompt} | completion: ${session.usage.completion} | cost: $${(session.cost || 0).toFixed(4)}\n`)
         );
         break;
       case "yolo":

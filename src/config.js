@@ -14,6 +14,12 @@ const DEFAULTS = {
   autoCompactChars: 120000,
   bashTimeoutMs: 120000,
   yolo: false,
+  budget: 0,
+  pricing: {
+    "k3-256k": { prompt: 0.6, completion: 2.5 },
+    "k3": { prompt: 0.6, completion: 2.5 },
+    "default": { prompt: 1.0, completion: 3.0 },
+  },
 };
 
 export function ensureDirs() {

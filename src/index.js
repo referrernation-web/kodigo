@@ -23,6 +23,7 @@ Flags:
   --yolo                    auto-approve all tool calls
   --plan                    read-only plan mode
   --model <name>            override the model
+  --budget <usd>            hard stop when session cost reaches this
 
 Env:
   KODIGO_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY
@@ -38,6 +39,7 @@ function parseArgs(argv) {
     else if (a === "--plan") opts.plan = true;
     else if (a === "-c" || a === "--continue") opts.cont = true;
     else if (a === "--model") opts.model = argv[++i];
+    else if (a === "--budget") opts.budget = parseFloat(argv[++i]) || 0;
     else if (a === "--help" || a === "-h") opts.help = true;
     else if (a === "--version" || a === "-v") opts.version = true;
     else opts._.push(a);
@@ -51,6 +53,7 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.yolo) config.yolo = true;
   if (opts.model) config.model = opts.model;
+  if (opts.budget) config.budget = opts.budget;
 
   if (opts.help) {
     process.stdout.write(HELP + "\n");

@@ -5,10 +5,12 @@ import { ensureDirs, SESSIONS_DIR } from "./config.js";
 
 export function newSession() {
   return {
+    version: 1,
     id: Date.now().toString(36) + "-" + crypto.randomBytes(2).toString("hex"),
     createdAt: new Date().toISOString(),
     messages: [],
     usage: { prompt: 0, completion: 0 },
+    cost: 0,
   };
 }
 
@@ -19,7 +21,12 @@ export function saveSession(s) {
 
 export function loadSession(id) {
   try {
-    return JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, id + ".json"), "utf8"));
+    const s = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, id + ".json"), "utf8"));
+    if (!s || !Array.isArray(s.messages)) return null;
+    s.version ??= 1;
+    s.usage ??= { prompt: 0, completion: 0 };
+    s.cost ??= 0;
+    return s;
   } catch {
     return null;
   }
