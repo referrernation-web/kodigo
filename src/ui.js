@@ -69,3 +69,75 @@ export function spinner() {
     },
   };
 }
+
+export function createTerminalRenderer() {
+  let spin = null;
+  let atLineStart = true;
+  const stopSpin = () => {
+    if (spin) {
+      spin.stop();
+      spin = null;
+    }
+  };
+  return function emit(ev) {
+    switch (ev.type) {
+      case "request_start":
+        if (!spin) spin = spinner();
+        break;
+      case "text":
+        stopSpin();
+        process.stdout.write(ev.text);
+        atLineStart = false;
+        break;
+      case "reasoning":
+        stopSpin();
+        process.stdout.write(paint("gray", ev.text));
+        atLineStart = false;
+        break;
+      case "message_end":
+        stopSpin();
+        if (!atLineStart) process.stdout.write("\n");
+        atLineStart = true;
+        break;
+      case "tool_start":
+        stopSpin();
+        if (!atLineStart) process.stdout.write("\n");
+        printTool(ev.name, ev.input);
+        atLineStart = true;
+        break;
+      case "tool_end": {
+        stopSpin();
+        const preview = String(ev.result).length > 400 ? String(ev.result).slice(0, 400) + "…" : String(ev.result);
+        process.stdout.write(paint("gray", "  ⎿ " + preview.replace(/\n/g, "\n    ") + "\n"));
+        atLineStart = true;
+        break;
+      }
+      case "usage":
+        stopSpin();
+        if (ev.cost > 0) process.stdout.write(paint("gray", `\n[$${ev.totalCost.toFixed(4)} total]`));
+        break;
+      case "info":
+        stopSpin();
+        if (!atLineStart) process.stdout.write("\n");
+        process.stdout.write(paint("gray", ev.text + "\n"));
+        atLineStart = true;
+        break;
+      case "error":
+        stopSpin();
+        if (!atLineStart) process.stdout.write("\n");
+        process.stdout.write(paint("red", "✗ " + ev.message + "\n"));
+        atLineStart = true;
+        break;
+      case "done":
+        stopSpin();
+        break;
+    }
+  };
+}
+
+export function createJsonRenderer() {
+  return function emit(ev) {
+    if (ev.type === "request_start") return;
+    process.stdout.write(JSON.stringify(ev) + "\n");
+  };
+}

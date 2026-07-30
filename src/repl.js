@@ -14,6 +14,7 @@ ${paint("bold", "Commands:")}
   /model [name]      show/switch model (no arg = pick from provider list)
   /models refresh    re-fetch available models from the provider
   /plan              toggle plan mode (read-only)
+  /status            session config + context usage
   /compact           force context compaction
   /usage             show token usage
   /yolo              toggle auto-approve of all tools
@@ -63,7 +64,19 @@ export async function startRepl({ config, session, initialPlanMode = false }) {
     prompt();
   });
 
-  const promptText = () => (planMode ? paint("yellow", "[plan] ") : "") + paint("green", "❯ ");
+  function contextWindowChars(model) {
+    const m = /(\d+)k/i.exec(model || "");
+    const tokens = m ? parseInt(m[1], 10) * 1000 : 128000;
+    return tokens * 4;
+  }
+
+  const promptText = () => {
+    const winChars = contextWindowChars(config.model);
+    const used = JSON.stringify(session.messages).length;
+    const pctLeft = Math.max(0, Math.round(100 - (used / winChars) * 100));
+    const ctx = paint("gray", `${pctLeft}% ctx`);
+    return (planMode ? paint("yellow", "[plan] ") : "") + paint("green", "❯ ") + ctx + " ";
+  };
   function prompt() {
     rl.setPrompt(promptText());
     rl.prompt();
@@ -143,6 +156,25 @@ export async function startRepl({ config, session, initialPlanMode = false }) {
         await compactSession(session, config);
         saveSession(session);
         process.stdout.write(paint("gray", "(compacted)\n"));
+        break;
+      }
+      case "status": {
+        const { detectShell } = await import("./tools.js");
+        const winChars = contextWindowChars(config.model);
+        const used = JSON.stringify(session.messages).length;
+        const pctLeft = Math.max(0, Math.round(100 - (used / winChars) * 100));
+        process.stdout.write(
+          [
+            `model:    ${config.model}`,
+            `baseURL:  ${config.baseURL}`,
+            `shell:    ${detectShell().name}`,
+            `session:  ${session.id} (${session.messages.length} messages)`,
+            `context:  ${pctLeft}% left (${used.toLocaleString()} chars)`,
+            `usage:    ${session.usage.prompt} prompt + ${session.usage.completion} completion tokens`,
+            `cost:     $${(session.cost || 0).toFixed(4)}${config.budget ? ` / budget $${config.budget}` : ""}`,
+            `mode:     ${planMode ? "plan (read-only)" : config.yolo ? "yolo" : "default"}`,
+          ].join("\n") + "\n"
+        );
         break;
       }
       case "usage":

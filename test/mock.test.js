@@ -353,6 +353,105 @@ test("discovery caches within TTL and refreshes on force", async () => {
   assert.strictEqual(calls, 2, `expected 2 HTTP calls, got ${calls}`);
 });
 
+// ---- M4: event seam ----
+
+test("agent emits structured events (tool_start/tool_end/usage/done)", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kodigo-test-"));
+  const origCwd = process.cwd();
+  process.chdir(tmp);
+  let requestCount = 0;
+  const server = await startMockServer(() => {
+    requestCount++;
+    if (requestCount === 1) {
+      return sse(toolCallChunks("c1", "write", JSON.stringify({ filePath: "ev.txt", content: "e" })));
+    }
+    return sse(textChunks("finished"));
+  });
+  const port = server.address().port;
+  const config = {
+    baseURL: `http://127.0.0.1:${port}/v1`,
+    apiKey: "t",
+    model: "mock",
+    maxSteps: 5,
+    autoCompactChars: 1e9,
+    bashTimeoutMs: 5000,
+    yolo: true,
+  };
+  const session = newSession();
+  const events = [];
+  await runAgent({
+    session,
+    userText: "go",
+    config,
+    permissions: { ask: async () => true },
+    emit: (ev) => events.push(ev),
+  });
+  server.close();
+  process.chdir(origCwd);
+  const types = events.map((e) => e.type);
+  assert.ok(types.includes("request_start"), "no request_start: " + types);
+  assert.ok(types.includes("tool_start"), "no tool_start");
+  assert.ok(types.includes("tool_end"), "no tool_end");
+  assert.ok(types.includes("text"), "no text");
+  assert.strictEqual(types[types.length - 1], "done");
+  const toolStart = events.find((e) => e.type === "tool_start");
+  assert.strictEqual(toolStart.name, "write");
+  assert.strictEqual(toolStart.input.filePath, "ev.txt");
+  const toolEnd = events.find((e) => e.type === "tool_end");
+  assert.ok(toolEnd.result.includes("ev.txt"));
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+test("custom emit receives no stdout interleaving requirement (json-safe)", async () => {
+  const { createJsonRenderer } = await import("../src/ui.js");
+  const lines = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (s) => {
+    lines.push(s);
+    return true;
+  };
+  try {
+    const emit = createJsonRenderer();
+    emit({ type: "request_start" });
+    emit({ type: "text", text: "hello" });
+    emit({ type: "done", reason: "complete" });
+  } finally {
+    process.stdout.write = origWrite;
+  }
+  assert.strictEqual(lines.length, 2, "request_start should be skipped in json mode");
+  assert.deepStrictEqual(JSON.parse(lines[0]), { type: "text", text: "hello" });
+  assert.deepStrictEqual(JSON.parse(lines[1]), { type: "done", reason: "complete" });
+});
+
+test("budget stop emits done with reason", async () => {
+  const server = await startMockServer(() => sse(textChunks("x")));
+  const port = server.address().port;
+  const config = {
+    baseURL: `http://127.0.0.1:${port}/v1`,
+    apiKey: "t",
+    model: "mock",
+    maxSteps: 5,
+    autoCompactChars: 1e9,
+    bashTimeoutMs: 5000,
+    yolo: true,
+    budget: 0.01,
+    pricing: { default: { prompt: 1, completion: 1 } },
+  };
+  const session = newSession();
+  session.cost = 0.02;
+  const events = [];
+  await runAgent({
+    session,
+    userText: "go",
+    config,
+    permissions: { ask: async () => true },
+    emit: (ev) => events.push(ev),
+  });
+  server.close();
+  const done = events.find((e) => e.type === "done");
+  assert.strictEqual(done?.reason, "budget");
+});
+
 let failures = 0;
 for (const { name, fn } of results) {
   try {
