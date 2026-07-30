@@ -297,6 +297,62 @@ test("budget hard stop prevents API call", async () => {
   assert.strictEqual(requests, 0, "API was called despite budget");
 });
 
+// ---- M3: provider auto-discovery ----
+
+test("discovery fetches and sorts models from /models", async () => {
+  const server = http.createServer((req, res) => {
+    assert.strictEqual(req.url, "/v1/models");
+    assert.strictEqual(req.headers.authorization, "Bearer testkey");
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ data: [{ id: "zeta" }, { id: "alpha" }, { id: "mid" }] }));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const port = server.address().port;
+  const { fetchModels } = await import("../src/discover.js");
+  const models = await fetchModels({ baseURL: `http://127.0.0.1:${port}/v1`, apiKey: "testkey" });
+  server.close();
+  assert.deepStrictEqual(models, ["alpha", "mid", "zeta"]);
+});
+
+test("discovery error hints on 401 and 404", async () => {
+  const { fetchModels } = await import("../src/discover.js");
+  for (const [status, hint] of [[401, "key rejected"], [404, "baseURL may be wrong"]]) {
+    const server = http.createServer((req, res) => {
+      res.writeHead(status);
+      res.end("{}");
+    });
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    const port = server.address().port;
+    await assert.rejects(
+      () => fetchModels({ baseURL: `http://127.0.0.1:${port}/v1`, apiKey: "k" }),
+      new RegExp(hint)
+    );
+    server.close();
+  }
+});
+
+test("discovery caches within TTL and refreshes on force", async () => {
+  let calls = 0;
+  const server = http.createServer((req, res) => {
+    calls++;
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ data: [{ id: "m" + calls }] }));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const port = server.address().port;
+  const baseURL = `http://127.0.0.1:${port}/v1`;
+  const { discoverModels } = await import("../src/discover.js");
+  const config = { baseURL, apiKey: "k", modelsCache: null };
+  const first = await discoverModels(config);
+  const second = await discoverModels(config); // cache hit
+  const third = await discoverModels(config, { force: true }); // refresh
+  server.close();
+  assert.deepStrictEqual(first, ["m1"]);
+  assert.deepStrictEqual(second, ["m1"]);
+  assert.deepStrictEqual(third, ["m2"]);
+  assert.strictEqual(calls, 2, `expected 2 HTTP calls, got ${calls}`);
+});
+
 let failures = 0;
 for (const { name, fn } of results) {
   try {

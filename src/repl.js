@@ -11,7 +11,8 @@ ${paint("bold", "Commands:")}
   /new               start a new session
   /sessions          list recent sessions
   /resume <id>       resume a session
-  /model [name]      show or set the model
+  /model [name]      show/switch model (no arg = pick from provider list)
+  /models refresh    re-fetch available models from the provider
   /plan              toggle plan mode (read-only)
   /compact           force context compaction
   /usage             show token usage
@@ -104,7 +105,33 @@ export async function startRepl({ config, session, initialPlanMode = false }) {
           config.model = arg;
           process.stdout.write(paint("gray", `(model set to ${arg})\n`));
         } else {
-          process.stdout.write(paint("gray", `model: ${config.model}\n`));
+          try {
+            const { discoverModels } = await import("./discover.js");
+            const models = await discoverModels(config);
+            process.stdout.write(paint("gray", `current: ${config.model}\navailable on ${config.baseURL}:\n`));
+            models.forEach((m, i) => process.stdout.write(`  ${paint("cyan", String(i + 1).padStart(3))}  ${m}${m === config.model ? paint("green", "  ←") : ""}\n`));
+            const pick = await new Promise((r) => rl.question(paint("bold", "Pick a number (Enter to keep current): "), r));
+            const n = parseInt(pick.trim(), 10);
+            if (n >= 1 && n <= models.length) {
+              config.model = models[n - 1];
+              process.stdout.write(paint("gray", `(model set to ${config.model})\n`));
+            }
+          } catch (e) {
+            process.stdout.write(paint("red", `Model discovery failed: ${e.message}\n`));
+          }
+        }
+        break;
+      case "models":
+        if (arg === "refresh") {
+          try {
+            const { discoverModels } = await import("./discover.js");
+            const models = await discoverModels(config, { force: true });
+            process.stdout.write(paint("gray", `(refreshed: ${models.length} models from ${config.baseURL})\n`));
+          } catch (e) {
+            process.stdout.write(paint("red", `Refresh failed: ${e.message}\n`));
+          }
+        } else {
+          process.stdout.write(paint("gray", "Usage: /models refresh\n"));
         }
         break;
       case "plan":
