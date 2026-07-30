@@ -115,60 +115,73 @@ export async function runAgent({ session, userText, config, permissions, planMod
       let usage = null;
       let errored = null;
 
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          acc = "";
-          calls = [];
-          usage = null;
-          emit({ type: "request_start" });
-          for await (const ev of streamChat({
-            baseURL: config.baseURL,
-            apiKey: config.apiKey,
-            model: config.model,
-            messages: [sysMsg, ...session.messages],
-            tools: TOOL_SCHEMAS,
-            signal,
-          })) {
-            if (ev.type === "text") {
-              acc += ev.text;
-              emit({ type: "text", text: ev.text });
-            } else if (ev.type === "reasoning") {
-              emit({ type: "reasoning", text: ev.text });
-            } else if (ev.type === "tool_calls") {
-              calls = ev.calls;
-            } else if (ev.type === "usage") {
-              usage = ev.usage;
+      const modelChain = [config.model, ...(config.fallbackModels || [])];
+      let modelIdx = 0;
+      modelLoop: while (modelIdx < modelChain.length) {
+        const activeModel = modelChain[modelIdx];
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            acc = "";
+            calls = [];
+            usage = null;
+            emit({ type: "request_start" });
+            for await (const ev of streamChat({
+              baseURL: config.baseURL,
+              apiKey: config.apiKey,
+              model: activeModel,
+              messages: [sysMsg, ...session.messages],
+              tools: TOOL_SCHEMAS,
+              signal,
+            })) {
+              if (ev.type === "text") {
+                acc += ev.text;
+                emit({ type: "text", text: ev.text });
+              } else if (ev.type === "reasoning") {
+                emit({ type: "reasoning", text: ev.text });
+              } else if (ev.type === "tool_calls") {
+                calls = ev.calls;
+              } else if (ev.type === "usage") {
+                usage = ev.usage;
+              }
             }
-          }
-          errored = null;
-          break;
-        } catch (e) {
-          if (e.name === "AbortError" || signal?.aborted) {
-            if (acc) {
-              session.messages.push({ role: "assistant", content: acc });
+            if (modelIdx > 0) session.lastModel = activeModel;
+            errored = null;
+            break modelLoop;
+          } catch (e) {
+            if (e.name === "AbortError" || signal?.aborted) {
+              if (acc) {
+                session.messages.push({ role: "assistant", content: acc });
+              }
+              emit({ type: "info", text: "(interrupted)" });
+              saveSession(session);
+              emit({ type: "done", reason: "interrupted" });
+              return;
             }
-            emit({ type: "info", text: "(interrupted)" });
-            saveSession(session);
-            emit({ type: "done", reason: "interrupted" });
-            return;
+            errored = e;
+            const retryable = /API (429|5\d\d)/.test(e.message);
+            if (retryable && attempt === 0) {
+              emit({ type: "info", text: `(retrying: ${e.message.split(":")[0]})` });
+              await new Promise((r) => setTimeout(r, 2000));
+              continue;
+            }
+            if (retryable && modelIdx < modelChain.length - 1) {
+              modelIdx++;
+              emit({ type: "info", text: `(model ${activeModel} unavailable — falling back to ${modelChain[modelIdx]})` });
+              continue modelLoop;
+            }
+            emit({ type: "error", message: e.message });
+            throw e;
           }
-          errored = e;
-          const retryable = /API (429|5\d\d)/.test(e.message);
-          if (attempt === 0 && retryable) {
-            emit({ type: "info", text: `(retrying: ${e.message.split(":")[0]})` });
-            await new Promise((r) => setTimeout(r, 2000));
-            continue;
-          }
-          emit({ type: "error", message: e.message });
-          throw e;
         }
       }
       if (errored) throw errored;
 
+      const costModel = session.lastModel || config.model;
+
       if (usage) {
         session.usage.prompt += usage.prompt_tokens || 0;
         session.usage.completion += usage.completion_tokens || 0;
-        const turn = turnCost(config, config.model, usage);
+        const turn = turnCost(config, costModel, usage);
         if (turn > 0) session.cost += turn;
         emit({ type: "usage", usage, cost: turn, totalCost: session.cost });
       }

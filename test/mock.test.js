@@ -553,14 +553,18 @@ test("memory: append + read round-trip", async () => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-test("memory: extractLearnings returns bullets, NONE handled", async () => {
-  const { extractLearnings, appendLearnings, readMemory } = await import("../src/memory.js");
-  let mode = "bullets";
+test("memory: extractLearnings splits MEMORY vs USER sections", async () => {
+  const { extractLearnings, appendLearnings, readMemory, USER_FILE } = await import("../src/memory.js");
   const server = await startMockServer((body) => {
-    // complete() is non-streaming; detect by absence of stream flag
     if (!body.stream) {
       return JSON.stringify({
-        choices: [{ message: { content: mode === "bullets" ? "- use npm via cmd, not powershell\n- k3-256k context is 256k tokens" : "NONE" } }],
+        choices: [
+          {
+            message: {
+              content: "MEMORY:\n- use npm via cmd, not powershell\n- tests: node test/mock.test.js\nUSER:\n- user is on Windows with blocked ps1 shims\n- prefers Tagalog responses",
+            },
+          },
+        ],
       });
     }
     return sse(textChunks("done"));
@@ -574,14 +578,26 @@ test("memory: extractLearnings returns bullets, NONE handled", async () => {
     { role: "tool", tool_call_id: "1", content: "passed" }
   );
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kodigo-test-"));
-  const out = await extractLearnings(session, config);
-  assert.ok(out.includes("npm via cmd"));
-  appendLearnings(out, tmp);
-  assert.ok(readMemory(tmp).includes("k3-256k"));
-  mode = "none";
-  const out2 = await extractLearnings(session, config);
-  assert.strictEqual(out2, "");
+  const out = await extractLearnings(session, config, tmp);
+  assert.ok(out.memory.includes("npm via cmd"), "memory section missing: " + JSON.stringify(out));
+  assert.ok(out.user.includes("Windows"), "user section missing");
+  appendLearnings(out.memory, tmp);
+  appendLearnings(out.user, tmp, USER_FILE);
+  assert.ok(readMemory(tmp).includes("mock.test.js"));
+  assert.ok(readMemory(tmp, USER_FILE).includes("Tagalog"));
+  assert.ok(!readMemory(tmp).includes("Tagalog"), "user fact leaked into MEMORY.md");
   server.close();
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+test("memory: dedupe skips already-known bullets", async () => {
+  const { appendLearnings, readMemory } = await import("../src/memory.js");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kodigo-test-"));
+  appendLearnings("- tests run via node test/mock.test.js", tmp);
+  const n = appendLearnings("- tests run via node test/mock.test.js\n- a genuinely new fact", tmp);
+  assert.strictEqual(n, 1, "duplicate should be filtered, only new fact appended");
+  const mem = readMemory(tmp);
+  assert.strictEqual((mem.match(/genuinely new/g) || []).length, 1);
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -728,6 +744,106 @@ test("post-hook stdout is appended to tool result", async () => {
   assert.ok(sawPostOutput, "post-hook output did not reach the model");
   process.chdir(origCwd);
   fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+// ---- F1: model fallback chain ----
+
+test("fallback: 429 on primary switches to fallback model and completes", async () => {
+  let primaryCalls = 0;
+  let fallbackCalls = 0;
+  const rawServer = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const parsed = JSON.parse(body);
+      if (parsed.model === "model-a") {
+        primaryCalls++;
+        res.writeHead(429, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "rate limit" } }));
+        return;
+      }
+      fallbackCalls++;
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.end(sse(textChunks("fallback answered")));
+    });
+  });
+  await new Promise((r) => rawServer.listen(0, "127.0.0.1", r));
+  const rawPort = rawServer.address().port;
+  const config = {
+    baseURL: `http://127.0.0.1:${rawPort}/v1`,
+    apiKey: "t",
+    model: "model-a",
+    fallbackModels: ["model-b"],
+    maxSteps: 3,
+    autoCompactChars: 1e9,
+    bashTimeoutMs: 5000,
+    yolo: true,
+  };
+  const session = newSession();
+  const events = [];
+  await runAgent({
+    session,
+    userText: "hi",
+    config,
+    permissions: { ask: async () => true },
+    emit: (ev) => events.push(ev),
+  });
+  rawServer.close();
+  assert.strictEqual(primaryCalls, 2, "primary tried initial + 1 retry");
+  assert.strictEqual(fallbackCalls, 1, "fallback called once");
+  assert.strictEqual(session.lastModel, "model-b");
+  const fallbackEvent = events.find((e) => e.type === "info" && e.text.includes("falling back to model-b"));
+  assert.ok(fallbackEvent, "no fallback event emitted");
+  const done = events.find((e) => e.type === "done");
+  assert.strictEqual(done?.reason, "complete");
+});
+
+test("fallback: exhausted chain surfaces the error", async () => {
+  const rawServer = http.createServer((req, res) => {
+    res.writeHead(429);
+    res.end("{}");
+  });
+  await new Promise((r) => rawServer.listen(0, "127.0.0.1", r));
+  const port = rawServer.address().port;
+  const config = {
+    baseURL: `http://127.0.0.1:${port}/v1`,
+    apiKey: "t",
+    model: "model-a",
+    fallbackModels: ["model-b"],
+    maxSteps: 3,
+    autoCompactChars: 1e9,
+    bashTimeoutMs: 5000,
+    yolo: true,
+  };
+  const session = newSession();
+  await assert.rejects(
+    () => runAgent({ session, userText: "hi", config, permissions: { ask: async () => true }, emit: () => {} }),
+    /429/
+  );
+  rawServer.close();
+});
+
+// ---- F2: /undo + /retry ----
+
+test("popLastTurn removes assistant turn + its user message", async () => {
+  const { popLastTurn } = await import("../src/session.js");
+  const session = newSession();
+  session.messages.push(
+    { role: "user", content: "first" },
+    { role: "assistant", content: "answer one" },
+    { role: "user", content: "second" },
+    { role: "assistant", content: null, tool_calls: [{ id: "t1", type: "function", function: { name: "read", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "t1", content: "data" },
+    { role: "assistant", content: "answer two" }
+  );
+  const removed = popLastTurn(session);
+  assert.strictEqual(removed, "second");
+  assert.strictEqual(session.messages.length, 2);
+  assert.strictEqual(session.messages[1].content, "answer one");
+  const removed2 = popLastTurn(session);
+  assert.strictEqual(removed2, "first");
+  assert.strictEqual(session.messages.length, 0);
+  assert.strictEqual(popLastTurn(session), null);
 });
 
 let failures = 0;

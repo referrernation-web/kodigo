@@ -1,7 +1,7 @@
 import readline from "node:readline";
 import { runAgent } from "./agent.js";
 import { createPermissions } from "./permissions.js";
-import { newSession, loadSession, listSessions, saveSession } from "./session.js";
+import { newSession, loadSession, listSessions, saveSession, popLastTurn } from "./session.js";
 import { saveConfig } from "./config.js";
 import { paint } from "./ui.js";
 
@@ -9,10 +9,13 @@ const HELP = `
 ${paint("bold", "Commands:")}
   /help              show this help
   /new               start a new session
+  /undo              remove the last turn
+  /retry             re-run the last message
   /sessions          list recent sessions
   /resume <id>       resume a session
   /model [name]      show/switch model (no arg = pick from provider list)
   /models refresh    re-fetch available models from the provider
+  /fallback [model]  add/show fallback models (used on 429/5xx)
   /plan              toggle plan mode (read-only)
   /review [base]     read-only review of uncommitted (or vs base) changes
   /rewind            restore the pre-task checkpoint
@@ -152,6 +155,23 @@ export async function startRepl({ config, session, initialPlanMode = false }) {
           process.stdout.write(paint("gray", "Usage: /models refresh\n"));
         }
         break;
+      case "fallback":
+        if (arg) {
+          config.fallbackModels = config.fallbackModels || [];
+          if (arg === "clear") {
+            config.fallbackModels = [];
+            process.stdout.write(paint("gray", "(fallbacks cleared)\n"));
+          } else if (!config.fallbackModels.includes(arg)) {
+            config.fallbackModels.push(arg);
+            process.stdout.write(paint("gray", `(fallback added: ${arg})\n`));
+          }
+        } else {
+          const list = config.fallbackModels || [];
+          process.stdout.write(
+            paint("gray", list.length ? `chain: ${config.model} → ${list.join(" → ")}` : "(no fallbacks — /fallback <model> to add)") + "\n"
+          );
+        }
+        break;
       case "plan":
         planMode = !planMode;
         process.stdout.write(paint("gray", `(plan mode ${planMode ? "on" : "off"})\n`));
@@ -251,9 +271,40 @@ export async function startRepl({ config, session, initialPlanMode = false }) {
         break;
       }
       case "memory": {
-        const { readMemory } = await import("./memory.js");
+        const { readMemory, USER_FILE, SOUL_FILE } = await import("./memory.js");
         const mem = readMemory(process.cwd());
-        process.stdout.write(mem ? mem + "\n" : paint("gray", "(no memory yet — learnings appear here as you work)\n"));
+        const user = readMemory(process.cwd(), USER_FILE);
+        const soul = readMemory(process.cwd(), SOUL_FILE);
+        if (!mem && !user && !soul) {
+          process.stdout.write(paint("gray", "(no memory yet — learnings appear here as you work)\n"));
+        } else {
+          if (soul) process.stdout.write(paint("bold", "SOUL.md\n") + soul + "\n");
+          if (mem) process.stdout.write(paint("bold", "MEMORY.md\n") + mem + "\n");
+          if (user) process.stdout.write(paint("bold", "USER.md\n") + user + "\n");
+        }
+        break;
+      }
+      case "personality": {
+        const fsMod = await import("node:fs");
+        const pathMod = await import("node:path");
+        if (!arg) {
+          process.stdout.write(paint("gray", "Usage: /personality <name|off> — sets SOUL.md persona\n"));
+          break;
+        }
+        const personas = {
+          concise: "You are terse and direct. Minimal words, no fluff, code-first answers.",
+          mentor: "You are a patient mentor. Explain the why behind changes, teach as you go.",
+          pirate: "You are a pirate. Arr. Otherwise a fully capable coding agent.",
+        };
+        const p = pathMod.join(process.cwd(), "SOUL.md");
+        if (arg === "off") {
+          try { fsMod.unlinkSync(p); } catch {}
+          process.stdout.write(paint("gray", "(persona cleared)\n"));
+        } else {
+          const body = personas[arg] || arg; // unknown names treated as literal persona text
+          fsMod.writeFileSync(p, `# Persona\n\n${body}\n`);
+          process.stdout.write(paint("gray", `(persona set → SOUL.md${personas[arg] ? "" : " (custom)"})\n`));
+        }
         break;
       }
       case "usage":
@@ -275,51 +326,7 @@ export async function startRepl({ config, session, initialPlanMode = false }) {
     }
   }
 
-  rl.on("line", async (line) => {
-    const input = line.trim();
-    if (!input) {
-      prompt();
-      return;
-    }
-    rl.pause();
-    if (input.startsWith("/")) {
-      const [cmdName, ...cmdRest] = input.slice(1).split(/\s+/);
-      const { loadCommands } = await import("./commands.js");
-      const custom = loadCommands(process.cwd()).get(cmdName);
-      if (custom) {
-        const body = custom.body.replace(/\$ARGUMENTS/g, cmdRest.join(" "));
-        running = true;
-        currentAbort = new AbortController();
-        try {
-          const { createCheckpoint } = await import("./checkpoint.js");
-          lastCheckpoint = createCheckpoint(process.cwd());
-        } catch {
-          lastCheckpoint = null;
-        }
-        try {
-          process.stdout.write("\n");
-          await runAgent({
-            session,
-            userText: body,
-            config,
-            permissions,
-            planMode,
-            signal: currentAbort.signal,
-          });
-          process.stdout.write("\n");
-        } catch (e) {
-          process.stdout.write(paint("red", `✗ ${e.message}\n`));
-        } finally {
-          running = false;
-          currentAbort = null;
-        }
-        prompt();
-        return;
-      }
-      await handleSlash(input);
-      prompt();
-      return;
-    }
+  async function runTask(userText) {
     running = true;
     currentAbort = new AbortController();
     try {
@@ -332,7 +339,7 @@ export async function startRepl({ config, session, initialPlanMode = false }) {
       process.stdout.write("\n");
       await runAgent({
         session,
-        userText: input,
+        userText,
         config,
         permissions,
         planMode,
@@ -340,11 +347,15 @@ export async function startRepl({ config, session, initialPlanMode = false }) {
       });
       process.stdout.write("\n");
       try {
-        const { extractLearnings, appendLearnings } = await import("./memory.js");
-        const learnings = await extractLearnings(session, config);
-        if (learnings) {
-          const n = appendLearnings(learnings, process.cwd());
-          if (n) process.stdout.write(paint("gray", `(memory: +${n} learning${n > 1 ? "s" : ""} → MEMORY.md)\n`));
+        const { extractLearnings, appendLearnings, USER_FILE } = await import("./memory.js");
+        const { memory: mem, user } = await extractLearnings(session, config, process.cwd());
+        const nM = mem ? appendLearnings(mem, process.cwd()) : 0;
+        const nU = user ? appendLearnings(user, process.cwd(), USER_FILE) : 0;
+        if (nM || nU) {
+          const parts = [];
+          if (nM) parts.push(`+${nM} → MEMORY.md`);
+          if (nU) parts.push(`+${nU} → USER.md`);
+          process.stdout.write(paint("gray", `(memory: ${parts.join(", ")})\n`));
         }
       } catch {}
     } catch (e) {
@@ -353,6 +364,50 @@ export async function startRepl({ config, session, initialPlanMode = false }) {
       running = false;
       currentAbort = null;
     }
+  }
+
+  rl.on("line", async (line) => {
+    const input = line.trim();
+    if (!input) {
+      prompt();
+      return;
+    }
+    rl.pause();
+    if (input === "/undo") {
+      const removed = popLastTurn(session);
+      process.stdout.write(
+        paint("gray", removed ? `(undid last turn: "${removed.slice(0, 60)}${removed.length > 60 ? "…" : ""}")` : "(nothing to undo)") + "\n"
+      );
+      prompt();
+      return;
+    }
+    if (input === "/retry") {
+      const removed = popLastTurn(session);
+      if (!removed) {
+        process.stdout.write(paint("gray", "(nothing to retry)\n"));
+        prompt();
+        return;
+      }
+      process.stdout.write(paint("gray", `(retrying: "${removed.slice(0, 60)}${removed.length > 60 ? "…" : ""}")\n`));
+      await runTask(removed);
+      prompt();
+      return;
+    }
+    if (input.startsWith("/")) {
+      const [cmdName, ...cmdRest] = input.slice(1).split(/\s+/);
+      const { loadCommands } = await import("./commands.js");
+      const custom = loadCommands(process.cwd()).get(cmdName);
+      if (custom) {
+        const body = custom.body.replace(/\$ARGUMENTS/g, cmdRest.join(" "));
+        await runTask(body);
+        prompt();
+        return;
+      }
+      await handleSlash(input);
+      prompt();
+      return;
+    }
+    await runTask(input);
     prompt();
   });
 

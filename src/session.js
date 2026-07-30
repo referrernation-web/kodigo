@@ -54,8 +54,17 @@ export function listSessions(n = 10) {
   });
 }
 
-function listSessionFiles() {
-  ensureDirs();
+export function popLastTurn(session) {
+  while (session.messages.length && session.messages[session.messages.length - 1].role !== "user") {
+    session.messages.pop();
+  }
+  if (!session.messages.length) return null;
+  const userMsg = session.messages.pop();
+  saveSession(session);
+  return typeof userMsg.content === "string" ? userMsg.content : null;
+}
+
+function listSessionFiles() {  ensureDirs();
   try {
     return fs
       .readdirSync(SESSIONS_DIR)
