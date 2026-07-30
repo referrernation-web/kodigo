@@ -14,6 +14,8 @@ ${paint("bold", "Commands:")}
   /model [name]      show/switch model (no arg = pick from provider list)
   /models refresh    re-fetch available models from the provider
   /plan              toggle plan mode (read-only)
+  /review [base]     read-only review of uncommitted (or vs base) changes
+  /rewind            restore the pre-task checkpoint
   /status            session config + context usage
   /compact           force context compaction
   /usage             show token usage
@@ -27,6 +29,7 @@ export async function startRepl({ config, session, initialPlanMode = false }) {
   let running = false;
   let currentAbort = null;
   let lastSigint = 0;
+  let lastCheckpoint = null;
 
   const permissions = createPermissions({ yolo: config.yolo, rl });
 
@@ -177,6 +180,51 @@ export async function startRepl({ config, session, initialPlanMode = false }) {
         );
         break;
       }
+      case "review": {
+        const { currentDiff } = await import("./checkpoint.js");
+        const diff = currentDiff(process.cwd(), arg || null);
+        if (diff.length > 30000) {
+          process.stdout.write(paint("yellow", `(diff is ${diff.length} chars — truncated to 30k for review)\n`));
+        }
+        running = true;
+        currentAbort = new AbortController();
+        try {
+          process.stdout.write("\n");
+          await runAgent({
+            session,
+            userText:
+              "Review the following code changes. Do NOT modify any files. Report prioritized findings: bugs, security issues, regressions, and style problems. If clean, say so.\n\n```diff\n" +
+              diff.slice(0, 30000) +
+              "\n```",
+            config,
+            permissions,
+            planMode: true,
+            signal: currentAbort.signal,
+          });
+          process.stdout.write("\n");
+        } catch (e) {
+          process.stdout.write(paint("red", `✗ ${e.message}\n`));
+        } finally {
+          running = false;
+          currentAbort = null;
+        }
+        break;
+      }
+      case "rewind": {
+        if (!lastCheckpoint) {
+          process.stdout.write(paint("gray", "(no checkpoint yet — checkpoints are created before each task)\n"));
+          break;
+        }
+        const { rewind } = await import("./checkpoint.js");
+        try {
+          const msg = rewind(process.cwd(), lastCheckpoint);
+          lastCheckpoint = null;
+          process.stdout.write(paint("gray", `(rewound: ${msg})\n`));
+        } catch (e) {
+          process.stdout.write(paint("red", `✗ rewind failed: ${e.message}\n`));
+        }
+        break;
+      }
       case "usage":
         process.stdout.write(
           paint("gray", `prompt: ${session.usage.prompt} | completion: ${session.usage.completion} | cost: $${(session.cost || 0).toFixed(4)}\n`)
@@ -210,6 +258,12 @@ export async function startRepl({ config, session, initialPlanMode = false }) {
     }
     running = true;
     currentAbort = new AbortController();
+    try {
+      const { createCheckpoint } = await import("./checkpoint.js");
+      lastCheckpoint = createCheckpoint(process.cwd());
+    } catch {
+      lastCheckpoint = null;
+    }
     try {
       process.stdout.write("\n");
       await runAgent({

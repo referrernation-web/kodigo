@@ -452,6 +452,90 @@ test("budget stop emits done with reason", async () => {
   assert.strictEqual(done?.reason, "budget");
 });
 
+// ---- M5: checkpoints + rewind ----
+
+test("checkpoint + rewind restores exact state in a git repo", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const { createCheckpoint, rewind, isGitRepo } = await import("../src/checkpoint.js");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kodigo-test-"));
+  const g = (args) => execFileSync("git", args, { cwd: tmp, stdio: "ignore" });
+  g(["init", "-b", "main"]);
+  g(["config", "user.email", "t@t"]);
+  g(["config", "user.name", "t"]);
+  fs.writeFileSync(path.join(tmp, "a.txt"), "original");
+  g(["add", "-A"]);
+  g(["commit", "-m", "init"]);
+  assert.ok(isGitRepo(tmp));
+
+  fs.writeFileSync(path.join(tmp, "a.txt"), "checkpoint-state");
+  fs.writeFileSync(path.join(tmp, "b.txt"), "new-at-checkpoint");
+  const cp = createCheckpoint(tmp);
+  assert.strictEqual(cp.kind, "git");
+
+  // index must be untouched by checkpointing
+  const statusAfterCp = execFileSync("git", ["status", "--porcelain"], { cwd: tmp, encoding: "utf8" });
+  assert.ok(statusAfterCp.includes(" b.txt") || statusAfterCp.includes("?? b.txt"), "checkpoint polluted index: " + statusAfterCp);
+
+  // make post-checkpoint changes
+  fs.writeFileSync(path.join(tmp, "a.txt"), "post-checkpoint-damage");
+  fs.writeFileSync(path.join(tmp, "c.txt"), "created-after");
+  fs.unlinkSync(path.join(tmp, "b.txt"));
+
+  rewind(tmp, cp);
+  assert.strictEqual(fs.readFileSync(path.join(tmp, "a.txt"), "utf8"), "checkpoint-state");
+  assert.strictEqual(fs.readFileSync(path.join(tmp, "b.txt"), "utf8"), "new-at-checkpoint");
+  assert.ok(!fs.existsSync(path.join(tmp, "c.txt")), "post-checkpoint file should be gone");
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+test("checkpoint falls back to shadow copy outside git", async () => {
+  const { createCheckpoint, rewind } = await import("../src/checkpoint.js");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kodigo-test-"));
+  fs.writeFileSync(path.join(tmp, "x.txt"), "v1");
+  const cp = createCheckpoint(tmp);
+  assert.strictEqual(cp.kind, "shadow");
+  fs.writeFileSync(path.join(tmp, "x.txt"), "v2");
+  rewind(tmp, cp);
+  assert.strictEqual(fs.readFileSync(path.join(tmp, "x.txt"), "utf8"), "v1");
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+test("review flow runs read-only and leaves files untouched", async () => {
+  const { currentDiff } = await import("../src/checkpoint.js");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kodigo-test-"));
+  const origCwd = process.cwd();
+  process.chdir(tmp);
+  const server = await startMockServer(() => sse(textChunks("LGTM, no findings")));
+  const port = server.address().port;
+  const config = {
+    baseURL: `http://127.0.0.1:${port}/v1`,
+    apiKey: "t",
+    model: "mock",
+    maxSteps: 3,
+    autoCompactChars: 1e9,
+    bashTimeoutMs: 5000,
+    yolo: true,
+  };
+  const session = newSession();
+  const diff = currentDiff(tmp, null); // non-git dir → graceful message
+  assert.ok(diff.includes("not a git repository"));
+  const events = [];
+  await runAgent({
+    session,
+    userText: "Review these changes, do NOT modify files.\n\n```diff\n" + diff + "\n```",
+    config,
+    permissions: { ask: async () => true },
+    planMode: true,
+    emit: (ev) => events.push(ev),
+  });
+  server.close();
+  process.chdir(origCwd);
+  assert.strictEqual(fs.readdirSync(tmp).length, 0, "review created files");
+  const done = events.find((e) => e.type === "done");
+  assert.strictEqual(done?.reason, "complete");
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
 let failures = 0;
 for (const { name, fn } of results) {
   try {
