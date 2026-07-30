@@ -1,0 +1,17 @@
+{
+  "name": "kodigo",
+  "version": "0.1.0",
+  "description": "Zero-dependency AI coding agent CLI. Works with any OpenAI-compatible API.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "kodigo": "./src/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node test/mock.test.js",
+    "start": "node src/index.js"
+  }
+}
