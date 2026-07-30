@@ -846,6 +846,101 @@ test("popLastTurn removes assistant turn + its user message", async () => {
   assert.strictEqual(popLastTurn(session), null);
 });
 
+// ---- F4: auto-skill creation ----
+
+test("proposeSkill returns valid command markdown, rejects NONE and junk", async () => {
+  const { proposeSkill } = await import("../src/skills.js");
+  let mode = "skill";
+  const server = await startMockServer((body) => {
+    if (!body.stream) {
+      const content =
+        mode === "skill"
+          ? '---\nname: fix-lint\ndescription: Fix lint errors and verify\n---\nFix all lint errors in $ARGUMENTS, run the linter, and iterate until clean.\n'
+          : mode === "none"
+            ? "NONE"
+            : "---\nname: Bad Name!!\n---\njunk";
+      return JSON.stringify({ choices: [{ message: { content } }] });
+    }
+    return sse(textChunks("done"));
+  });
+  const port = server.address().port;
+  const config = { baseURL: `http://127.0.0.1:${port}/v1`, apiKey: "t", model: "mock" };
+  const session = newSession();
+  session.messages.push(
+    { role: "user", content: "fix lint" },
+    { role: "assistant", content: null, tool_calls: [{ id: "1", type: "function", function: { name: "bash", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "1", content: "3 errors" },
+    { role: "assistant", content: "fixed" }
+  );
+  const skill = await proposeSkill(session, config, 0);
+  assert.ok(skill, "expected a skill proposal");
+  assert.strictEqual(skill.name, "fix-lint");
+  assert.ok(skill.content.includes("$ARGUMENTS"));
+  mode = "none";
+  assert.strictEqual(await proposeSkill(session, config, 0), null);
+  mode = "junk";
+  assert.strictEqual(await proposeSkill(session, config, 0), null);
+  server.close();
+});
+
+test("saveSkill writes a loadable command file", async () => {
+  const { saveSkill } = await import("../src/skills.js");
+  const { loadCommands } = await import("../src/commands.js");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kodigo-test-"));
+  saveSkill("fix-lint", '---\nname: fix-lint\ndescription: Fix lint errors\n---\nFix lint in $ARGUMENTS\n', tmp);
+  const cmds = loadCommands(tmp);
+  const cmd = cmds.get("fix-lint");
+  assert.ok(cmd, "saved skill not loadable");
+  assert.strictEqual(cmd.description, "Fix lint errors");
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+test("countToolCallsSince counts only the last turn", async () => {
+  const { countToolCallsSince } = await import("../src/skills.js");
+  const msgs = [
+    { role: "user", content: "old" },
+    { role: "assistant", content: null, tool_calls: [{}, {}] },
+    { role: "user", content: "new turn" },
+    { role: "assistant", content: null, tool_calls: [{}, {}, {}] },
+  ];
+  assert.strictEqual(countToolCallsSince(msgs, 2), 3);
+  assert.strictEqual(countToolCallsSince(msgs, 0), 5);
+});
+
+// ---- F5: /recall ----
+
+test("recall searches across session files and summarizes", async () => {
+  const { searchSessions, recall } = await import("../src/recall.js");
+  const { saveSession, newSession } = await import("../src/session.js");
+  const s1 = newSession();
+  s1.messages.push({ role: "user", content: "help me set up docker compose for postgres" });
+  s1.messages.push({ role: "assistant", content: "here is the docker-compose.yml with postgres:16" });
+  const s2 = newSession();
+  s2.messages.push({ role: "user", content: "write a haiku about trees" });
+  saveSession(s1);
+  saveSession(s2);
+  try {
+    const hits = searchSessions("docker");
+    assert.ok(hits.length >= 2, `expected 2 hits, got ${hits.length}`);
+    assert.ok(hits.every((h) => /docker/i.test(h.snippet)));
+    assert.ok(!searchSessions("trees").some((h) => h.sessionId === s1.id));
+
+    const server = await startMockServer((body) => {
+      if (!body.stream) {
+        return JSON.stringify({ choices: [{ message: { content: "You set up docker compose with postgres:16 before." } }] });
+      }
+      return sse(textChunks("x"));
+    });
+    const port = server.address().port;
+    const { summary } = await recall("docker", { baseURL: `http://127.0.0.1:${port}/v1`, apiKey: "t", model: "m" });
+    server.close();
+    assert.ok(summary.includes("postgres"));
+  } finally {
+    fs.unlinkSync(path.join(os.homedir(), ".kodigo", "sessions", s1.id + ".json"));
+    fs.unlinkSync(path.join(os.homedir(), ".kodigo", "sessions", s2.id + ".json"));
+  }
+});
+
 let failures = 0;
 for (const { name, fn } of results) {
   try {

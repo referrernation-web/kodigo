@@ -21,7 +21,9 @@ ${paint("bold", "Commands:")}
   /rewind            restore the pre-task checkpoint
   /status            session config + context usage
   /init              generate AGENTS.md for this repo
-  /memory            show learned memory (MEMORY.md)
+  /memory            show learned memory (MEMORY.md/USER.md/SOUL.md)
+  /recall <query>    search past sessions
+  /personality <n>   set persona (concise/mentor/pirate/off)
   /compact           force context compaction
   /usage             show token usage
   /yolo              toggle auto-approve of all tools
@@ -307,6 +309,22 @@ export async function startRepl({ config, session, initialPlanMode = false }) {
         }
         break;
       }
+      case "recall": {
+        if (!arg) {
+          process.stdout.write(paint("gray", "Usage: /recall <query> — search past sessions\n"));
+          break;
+        }
+        const { recall } = await import("./recall.js");
+        const { hits, summary } = await recall(arg, config);
+        if (!hits.length) {
+          process.stdout.write(paint("gray", `(no past sessions mention "${arg}")\n`));
+          break;
+        }
+        process.stdout.write(paint("gray", `(${hits.length} excerpt${hits.length > 1 ? "s" : ""} from past sessions)\n`));
+        if (summary) process.stdout.write(summary + "\n");
+        else for (const h of hits) process.stdout.write(paint("gray", `  [${h.sessionId} · ${h.role}] ${h.snippet}\n`));
+        break;
+      }
       case "usage":
         process.stdout.write(
           paint("gray", `prompt: ${session.usage.prompt} | completion: ${session.usage.completion} | cost: $${(session.cost || 0).toFixed(4)}\n`)
@@ -329,6 +347,7 @@ export async function startRepl({ config, session, initialPlanMode = false }) {
   async function runTask(userText) {
     running = true;
     currentAbort = new AbortController();
+    const turnStart = session.messages.length;
     try {
       const { createCheckpoint } = await import("./checkpoint.js");
       lastCheckpoint = createCheckpoint(process.cwd());
@@ -356,6 +375,24 @@ export async function startRepl({ config, session, initialPlanMode = false }) {
           if (nM) parts.push(`+${nM} → MEMORY.md`);
           if (nU) parts.push(`+${nU} → USER.md`);
           process.stdout.write(paint("gray", `(memory: ${parts.join(", ")})\n`));
+        }
+      } catch {}
+      try {
+        const { countToolCallsSince, proposeSkill, saveSkill } = await import("./skills.js");
+        if (countToolCallsSince(session.messages, turnStart) >= 3 && process.stdin.isTTY) {
+          const proposal = await proposeSkill(session, config, turnStart);
+          if (proposal) {
+            const answer = await new Promise((r) =>
+              rl.question(
+                paint("bold", `That workflow looks reusable. Save as /${proposal.name} (${proposal.description || "custom command"})? [y/N] `),
+                r
+              )
+            );
+            if (answer.trim().toLowerCase().startsWith("y")) {
+              const p = saveSkill(proposal.name, proposal.content, process.cwd());
+              process.stdout.write(paint("gray", `(saved → ${p} — run it with /${proposal.name})\n`));
+            }
+          }
         }
       } catch {}
     } catch (e) {
